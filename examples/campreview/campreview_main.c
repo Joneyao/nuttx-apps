@@ -21,6 +21,33 @@
  ****************************************************************************/
 
 /****************************************************************************
+ * Camera preview: RGB565 frames from /dev/video0 onto RGB565 /dev/fb0.
+ *
+ * There are two paths, picked at runtime from what fb0 reports.
+ *
+ * Zero-copy (fb0 is double buffered: yres_virtual covers two frames and a
+ * single mmap covers both):
+ *
+ *   The two framebuffer halves are handed to the capture driver as
+ *   V4L2_MEMORY_USERPTR buffers, so the camera DMA writes pixels straight
+ *   into display memory. Each dequeued frame is published with
+ *   FBIOPAN_DISPLAY at the matching yoffset and requeued. No memcpy runs
+ *   at all, and the CPU never writes the framebuffer, so its cache lines
+ *   stay clean and cannot race the CSI frame-done invalidate.
+ *
+ * Copy (fb0 exposes a single buffer):
+ *
+ *   Two private capture buffers, each dequeued frame copied into the
+ *   mmap'ed framebuffer, then FBIOPAN_DISPLAY to write it back for the
+ *   display DMA.
+ *
+ * FBIOPAN_DISPLAY is the only ioctl that reaches the driver's pandisplay
+ * hook, which is where both the buffer flip and the cache writeback live.
+ * FBIO_UPDATE is not usable: it needs CONFIG_FB_UPDATE and routes to
+ * updatearea, which this framebuffer does not implement.
+ ****************************************************************************/
+
+/****************************************************************************
  * Included Files
  ****************************************************************************/
 
@@ -52,8 +79,8 @@
 #define CAMPREVIEW_VIDEO_DEV  "/dev/video0"
 #define CAMPREVIEW_FB_DEV     "/dev/fb0"
 
-/* Two capture buffers so the sensor can fill one while we copy the
- * other.  More would only add latency, the panel cannot show them.
+/* Two capture buffers so the sensor can fill one while the other is on
+ * screen.  More would only add latency, the panel cannot show them.
  */
 
 #define CAMPREVIEW_BUFNUM     2
@@ -61,7 +88,7 @@
 /* Buffer pointers handed to VIDIOC_QBUF must be at least 32-byte aligned.
  * Use a full 64-byte cache line, which is what the CSI driver aligns its
  * own DMA buffers to, so that a DMA write never shares a cache line with
- * anything else.
+ * anything else.  The framebuffer halves are already 64-byte aligned.
  */
 
 #define CAMPREVIEW_BUFALIGN   64
@@ -85,6 +112,7 @@ struct campreview_state_s
   int    fb_fd;
   int    v_fd;
   bool   streaming;
+  bool   zerocopy;                     /* Camera DMA writes fb directly */
 
   FAR uint8_t *fbmem;                  /* mmap'ed framebuffer */
   size_t       fblen;
@@ -92,8 +120,15 @@ struct campreview_state_s
   struct fb_videoinfo_s vinfo;
   struct fb_planeinfo_s pinfo;
 
+  uint32_t framesize;                  /* Bytes in one captured frame */
+  uint32_t halfsize;                   /* Bytes in one framebuffer half */
+  uint8_t  nbuffers;                   /* Framebuffer halves: 1 or 2 */
+  FAR uint8_t *halves[CAMPREVIEW_BUFNUM];
+
+  /* Private capture buffers, fallback (copy) path only. */
+
   struct campreview_buf_s bufs[CAMPREVIEW_BUFNUM];
-  uint8_t nbufs;                       /* Buffers actually allocated */
+  uint8_t nbufs;
 };
 
 /****************************************************************************
@@ -115,9 +150,13 @@ static void campreview_usage(FAR const char *progname)
   printf("Usage: %s [nframes]\n", progname);
   printf("       %s -h\n", progname);
   printf("\n");
-  printf("Capture RGB565 frames from %s and copy them into the\n",
-         CAMPREVIEW_VIDEO_DEV);
-  printf("RGB565 framebuffer %s.\n", CAMPREVIEW_FB_DEV);
+  printf("Preview RGB565 frames from %s on the RGB565 framebuffer %s.\n",
+         CAMPREVIEW_VIDEO_DEV, CAMPREVIEW_FB_DEV);
+  printf("\n");
+  printf("If %s is double buffered the capture DMA fills the framebuffer\n",
+         CAMPREVIEW_FB_DEV);
+  printf("halves directly and pages between them, with no copy at all.\n");
+  printf("Otherwise each frame is copied into the single buffer.\n");
   printf("\n");
   printf("  nframes  Number of frames to preview.  0 (the default) means\n");
   printf("           run until an error occurs or SIGINT is received.\n");
@@ -146,6 +185,11 @@ static uint64_t campreview_now_ms(void)
 
 /****************************************************************************
  * Name: campreview_free_bufs
+ *
+ * Description:
+ *   Release the private capture buffers.  Only the copy path allocates
+ *   any, so this is a no-op on the zero-copy path.
+ *
  ****************************************************************************/
 
 static void campreview_free_bufs(FAR struct campreview_state_s *st)
@@ -166,15 +210,21 @@ static void campreview_free_bufs(FAR struct campreview_state_s *st)
  * Name: campreview_fb_open
  *
  * Description:
- *   Open the framebuffer, query its geometry and map it into the process.
+ *   Open the framebuffer, query its geometry, work out how many buffers it
+ *   exposes and map the whole thing into the process.
+ *
  *   mmap() is used rather than pinfo.fbmem directly because that is what
  *   apps/examples/fb does: in a KERNEL build only mmap() returns an address
- *   the application may touch.
+ *   the application may touch.  The map covers pinfo.fblen, so on a double
+ *   buffered device it covers both halves and buffer i starts at
+ *   fbmem + i * stride * yres.
  *
  ****************************************************************************/
 
 static int campreview_fb_open(FAR struct campreview_state_s *st)
 {
+  uint8_t i;
+
   st->fb_fd = open(CAMPREVIEW_FB_DEV, O_RDWR);
   if (st->fb_fd < 0)
     {
@@ -197,9 +247,11 @@ static int campreview_fb_open(FAR struct campreview_state_s *st)
       return -errno;
     }
 
-  printf("campreview: fb %ux%u fmt=%u bpp=%u stride=%u fblen=%zu\n",
+  printf("campreview: fb %ux%u fmt=%u bpp=%u stride=%u fblen=%zu "
+         "yres_virtual=%u\n",
          st->vinfo.xres, st->vinfo.yres, st->vinfo.fmt,
-         st->pinfo.bpp, st->pinfo.stride, st->pinfo.fblen);
+         st->pinfo.bpp, st->pinfo.stride, st->pinfo.fblen,
+         (unsigned)st->pinfo.yres_virtual);
 
   if (st->vinfo.fmt != FB_FMT_RGB16_565 || st->pinfo.bpp != 16)
     {
@@ -217,6 +269,31 @@ static int campreview_fb_open(FAR struct campreview_state_s *st)
       return -EINVAL;
     }
 
+  st->halfsize  = (uint32_t)st->pinfo.stride * st->vinfo.yres;
+  st->framesize = (uint32_t)st->vinfo.xres * st->vinfo.yres * 2;
+
+  /* Double buffered when the virtual height covers two frames AND the
+   * mapping is large enough to hold both.  Both conditions matter: the
+   * first says a pan can select a half, the second says one mmap reaches
+   * it.
+   *
+   * A half is also required to be exactly one packed frame.  The camera
+   * DMA writes rows back to back, so a framebuffer stride wider than
+   * xres * 2 could not be filled directly; such a device is driven down
+   * the copy path, which handles the padding row by row.
+   */
+
+  if (st->pinfo.yres_virtual >= (unsigned)st->vinfo.yres * 2 &&
+      st->pinfo.fblen >= (size_t)st->halfsize * 2 &&
+      st->halfsize == st->framesize)
+    {
+      st->nbuffers = 2;
+    }
+  else
+    {
+      st->nbuffers = 1;
+    }
+
   st->fblen = st->pinfo.fblen;
   st->fbmem = mmap(NULL, st->fblen, PROT_READ | PROT_WRITE,
                    MAP_SHARED | MAP_FILE, st->fb_fd, 0);
@@ -227,6 +304,13 @@ static int campreview_fb_open(FAR struct campreview_state_s *st)
       return -errno;
     }
 
+  for (i = 0; i < st->nbuffers; i++)
+    {
+      st->halves[i] = st->fbmem + (size_t)i * st->halfsize;
+    }
+
+  st->zerocopy = (st->nbuffers == 2);
+
   return OK;
 }
 
@@ -234,10 +318,12 @@ static int campreview_fb_open(FAR struct campreview_state_s *st)
  * Name: campreview_video_open
  *
  * Description:
- *   Open the capture device, set RGB565 at the panel resolution, allocate
- *   and queue the user-pointer buffers, then start streaming.
+ *   Open the capture device, set RGB565 at the panel resolution, queue the
+ *   user-pointer buffers and start streaming.
  *
- *   V4L2_MEMORY_USERPTR with V4L2_BUF_MODE_RING mirrors
+ *   The buffers are the two framebuffer halves on the zero-copy path and
+ *   two freshly allocated private buffers on the copy path.  Either way
+ *   V4L2_MEMORY_USERPTR with V4L2_BUF_MODE_RING is used, mirroring
  *   apps/examples/camera/camera_main.c, which is the pattern known to work
  *   with this driver stack.
  *
@@ -249,10 +335,8 @@ static int campreview_video_open(FAR struct campreview_state_s *st)
   struct v4l2_requestbuffers req;
   struct v4l2_format fmt;
   struct v4l2_buffer buf;
-  uint32_t framesize;
+  FAR uint8_t *addr;
   uint8_t i;
-
-  framesize = (uint32_t)st->vinfo.xres * st->vinfo.yres * 2;
 
   st->v_fd = open(CAMPREVIEW_VIDEO_DEV, O_RDWR);
   if (st->v_fd < 0)
@@ -288,28 +372,38 @@ static int campreview_video_open(FAR struct campreview_state_s *st)
       return -errno;
     }
 
-  for (i = 0; i < CAMPREVIEW_BUFNUM; i++)
-    {
-      st->bufs[i].start = memalign(CAMPREVIEW_BUFALIGN, framesize);
-      if (st->bufs[i].start == NULL)
-        {
-          printf("campreview: ERROR: out of memory for buffer %d (%lu B)\n",
-                 i, (unsigned long)framesize);
-          return -ENOMEM;
-        }
+  /* Allocate the private buffers on the copy path only.  On the zero-copy
+   * path the framebuffer halves ARE the capture buffers, so nothing is
+   * allocated and nothing has to be freed.
+   */
 
-      st->bufs[i].length = framesize;
-      st->nbufs          = i + 1;
+  if (!st->zerocopy)
+    {
+      for (i = 0; i < CAMPREVIEW_BUFNUM; i++)
+        {
+          st->bufs[i].start = memalign(CAMPREVIEW_BUFALIGN, st->framesize);
+          if (st->bufs[i].start == NULL)
+            {
+              printf("campreview: ERROR: out of memory for buffer %d "
+                     "(%lu B)\n", i, (unsigned long)st->framesize);
+              return -ENOMEM;
+            }
+
+          st->bufs[i].length = st->framesize;
+          st->nbufs          = i + 1;
+        }
     }
 
-  for (i = 0; i < st->nbufs; i++)
+  for (i = 0; i < CAMPREVIEW_BUFNUM; i++)
     {
+      addr = st->zerocopy ? st->halves[i] : st->bufs[i].start;
+
       memset(&buf, 0, sizeof(buf));
       buf.type      = type;
       buf.memory    = V4L2_MEMORY_USERPTR;
       buf.index     = i;
-      buf.m.userptr = (uintptr_t)st->bufs[i].start;
-      buf.length    = st->bufs[i].length;
+      buf.m.userptr = (uintptr_t)addr;
+      buf.length    = st->framesize;
 
       if (ioctl(st->v_fd, VIDIOC_QBUF, (uintptr_t)&buf) < 0)
         {
@@ -343,6 +437,12 @@ static void campreview_cleanup(FAR struct campreview_state_s *st)
       st->streaming = false;
     }
 
+  /* Stop the capture DMA before dropping the buffers it writes into.  The
+   * private buffers only exist on the copy path; campreview_free_bufs()
+   * walks nbufs, which stays 0 on the zero-copy path, so the framebuffer
+   * halves are never handed to free().
+   */
+
   campreview_free_bufs(st);
 
   if (st->fbmem != NULL)
@@ -365,33 +465,181 @@ static void campreview_cleanup(FAR struct campreview_state_s *st)
 }
 
 /****************************************************************************
- * Name: campreview_loop
+ * Name: campreview_pan
  *
  * Description:
- *   Dequeue, copy, hand the framebuffer to the display, requeue.
- *
- *   Both the capture buffer and the framebuffer are RGB565, so the frame
- *   is a straight copy with no colour-space work at all.
- *
- *   FBIOPAN_DISPLAY is what reaches the driver's pandisplay hook, which
- *   performs the cache writeback the DSI DMA needs.  FBIO_UPDATE is not
- *   usable here: it only exists when CONFIG_FB_UPDATE is enabled and it
- *   routes to the updatearea hook, which this framebuffer does not
- *   implement.  Without the writeback nothing would ever appear on screen.
+ *   Make framebuffer half 'index' the one the display scans out.  On a
+ *   single-buffer device index is always 0 and the pan is just the cache
+ *   writeback the display DMA needs.
  *
  ****************************************************************************/
 
-static int campreview_loop(FAR struct campreview_state_s *st,
-                           unsigned long nframes)
+static int campreview_pan(FAR struct campreview_state_s *st, uint8_t index)
+{
+  st->pinfo.yoffset = (uint32_t)index * st->vinfo.yres;
+
+  return ioctl(st->fb_fd, FBIOPAN_DISPLAY,
+               (unsigned long)((uintptr_t)&st->pinfo));
+}
+
+/****************************************************************************
+ * Name: campreview_report_fps
+ *
+ * Description:
+ *   Print a rate line every CAMPREVIEW_LOG_PERIOD frames and restart the
+ *   measurement window.  '*mark' is the timestamp the window started at.
+ *
+ ****************************************************************************/
+
+static void campreview_report_fps(unsigned long framecnt,
+                                  FAR uint64_t *mark)
+{
+  uint64_t now;
+  uint64_t elapsed;
+  unsigned fps10 = 0;
+
+  if ((framecnt % CAMPREVIEW_LOG_PERIOD) != 0)
+    {
+      return;
+    }
+
+  now     = campreview_now_ms();
+  elapsed = now - *mark;
+
+  if (elapsed > 0)
+    {
+      fps10 = (unsigned)((CAMPREVIEW_LOG_PERIOD * 10000ull) / elapsed);
+    }
+
+  printf("campreview: %lu frames, %u.%u fps\n",
+         framecnt, fps10 / 10, fps10 % 10);
+  *mark = now;
+}
+
+/****************************************************************************
+ * Name: campreview_loop_zerocopy
+ *
+ * Description:
+ *   Dequeue, publish, requeue.  No pixel ever moves under CPU control.
+ *
+ *   The camera DMA has already written the dequeued half and the CSI
+ *   frame-done ISR has invalidated it, so the half is coherent and this
+ *   task's cache lines over it are clean.  All that is left is to tell the
+ *   display which half to scan out.
+ *
+ *   Requeueing the half that was just made front means the camera may
+ *   start refilling a buffer that is still being scanned out, which can
+ *   tear.  With only two buffers there is no way around it: one is on
+ *   screen and the other must be in flight or frames get dropped.
+ *   Eliminating it needs a third buffer, or vsync feedback so the requeue
+ *   waits until the half is no longer front.
+ *
+ ****************************************************************************/
+
+static int campreview_loop_zerocopy(FAR struct campreview_state_s *st,
+                                    unsigned long nframes)
 {
   enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
   unsigned long framecnt = 0;
-  uint64_t mark;
   bool panwarned = false;
-  uint32_t rowpixels = st->vinfo.xres;
+  uint64_t mark;
+
+  mark = campreview_now_ms();
+
+  while (!g_campreview_stop && (nframes == 0 || framecnt < nframes))
+    {
+      struct v4l2_buffer buf;
+      uintptr_t filled;
+      uint8_t index;
+
+      memset(&buf, 0, sizeof(buf));
+      buf.type   = type;
+      buf.memory = V4L2_MEMORY_USERPTR;
+
+      if (ioctl(st->v_fd, VIDIOC_DQBUF, (uintptr_t)&buf) < 0)
+        {
+          if (errno == EINTR)
+            {
+              continue;
+            }
+
+          printf("campreview: ERROR: VIDIOC_DQBUF failed: %d\n", errno);
+          return -errno;
+        }
+
+      /* Work out which half came back.  The driver hands the pointer back
+       * in buf.m.userptr, so match it against the two half addresses
+       * rather than trusting buf.index.
+       */
+
+      filled = (uintptr_t)buf.m.userptr;
+      if (filled == (uintptr_t)st->halves[1])
+        {
+          index = 1;
+        }
+      else if (filled == (uintptr_t)st->halves[0])
+        {
+          index = 0;
+        }
+      else
+        {
+          printf("campreview: ERROR: unexpected userptr %p\n",
+                 (FAR void *)filled);
+          return -EINVAL;
+        }
+
+      /* Publish the half the camera just filled. */
+
+      if (campreview_pan(st, index) < 0 && !panwarned)
+        {
+          printf("campreview: WARNING: FBIOPAN_DISPLAY failed: %d\n",
+                 errno);
+          panwarned = true;
+        }
+
+      /* Hand the same half back for a future frame. */
+
+      if (ioctl(st->v_fd, VIDIOC_QBUF, (uintptr_t)&buf) < 0)
+        {
+          printf("campreview: ERROR: VIDIOC_QBUF failed: %d\n", errno);
+          return -errno;
+        }
+
+      framecnt++;
+      campreview_report_fps(framecnt, &mark);
+    }
+
+  printf("campreview: stopped after %lu frames\n", framecnt);
+  return OK;
+}
+
+/****************************************************************************
+ * Name: campreview_loop_copy
+ *
+ * Description:
+ *   Fallback for a single-buffer framebuffer: dequeue, copy, pan, requeue.
+ *
+ *   Both the capture buffer and the framebuffer are RGB565, so the frame
+ *   is a straight copy with no colour-space work at all.  The pan is what
+ *   performs the cache writeback; skipping it leaves the display DMA on
+ *   stale pixels.
+ *
+ *   The copy cannot be avoided here.  fb0 only exposes the buffer the
+ *   display DMA is reading, so letting the camera DMA write it would scan
+ *   out memory that is being overwritten and would put the same region
+ *   under both an ISR-side invalidate and a task-side writeback.
+ *
+ ****************************************************************************/
+
+static int campreview_loop_copy(FAR struct campreview_state_s *st,
+                                unsigned long nframes)
+{
+  enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  unsigned long framecnt = 0;
+  bool panwarned = false;
+  uint32_t srcstride = (uint32_t)st->vinfo.xres * 2;
   uint32_t nrows = st->vinfo.yres;
-  uint32_t srcstride = rowpixels * 2;
-  int ret = OK;
+  uint64_t mark;
 
   mark = campreview_now_ms();
 
@@ -440,12 +688,7 @@ static int campreview_loop(FAR struct campreview_state_s *st,
             }
         }
 
-      /* Hand the framebuffer to the display.  This is the cache
-       * writeback; skipping it leaves the DMA on stale data.
-       */
-
-      if (ioctl(st->fb_fd, FBIOPAN_DISPLAY,
-                (unsigned long)((uintptr_t)&st->pinfo)) < 0 && !panwarned)
+      if (campreview_pan(st, 0) < 0 && !panwarned)
         {
           printf("campreview: WARNING: FBIOPAN_DISPLAY failed: %d\n",
                  errno);
@@ -461,27 +704,11 @@ static int campreview_loop(FAR struct campreview_state_s *st,
         }
 
       framecnt++;
-
-      if ((framecnt % CAMPREVIEW_LOG_PERIOD) == 0)
-        {
-          uint64_t now = campreview_now_ms();
-          uint64_t elapsed = now - mark;
-          unsigned fps10 = 0;
-
-          if (elapsed > 0)
-            {
-              fps10 = (unsigned)((CAMPREVIEW_LOG_PERIOD * 10000ull) /
-                                 elapsed);
-            }
-
-          printf("campreview: %lu frames, %u.%u fps\n",
-                 framecnt, fps10 / 10, fps10 % 10);
-          mark = now;
-        }
+      campreview_report_fps(framecnt, &mark);
     }
 
   printf("campreview: stopped after %lu frames\n", framecnt);
-  return ret;
+  return OK;
 }
 
 /****************************************************************************
@@ -530,11 +757,19 @@ int main(int argc, FAR char *argv[])
       return EXIT_FAILURE;
     }
 
-  printf("campreview: preview %ux%u RGB565 -> RGB565, %s\n",
+  printf("campreview: preview %ux%u RGB565 -> RGB565, %s, %s\n",
          st.vinfo.xres, st.vinfo.yres,
+         st.zerocopy ? "zero-copy" : "copy",
          nframes == 0 ? "until stopped" : "limited run");
 
-  ret = campreview_loop(&st, nframes);
+  if (st.zerocopy)
+    {
+      ret = campreview_loop_zerocopy(&st, nframes);
+    }
+  else
+    {
+      ret = campreview_loop_copy(&st, nframes);
+    }
 
   campreview_cleanup(&st);
   return ret < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
