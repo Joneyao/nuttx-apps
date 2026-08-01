@@ -52,7 +52,7 @@
 #define CAMPREVIEW_VIDEO_DEV  "/dev/video0"
 #define CAMPREVIEW_FB_DEV     "/dev/fb0"
 
-/* Two capture buffers so the sensor can fill one while we convert the
+/* Two capture buffers so the sensor can fill one while we copy the
  * other.  More would only add latency, the panel cannot show them.
  */
 
@@ -115,9 +115,9 @@ static void campreview_usage(FAR const char *progname)
   printf("Usage: %s [nframes]\n", progname);
   printf("       %s -h\n", progname);
   printf("\n");
-  printf("Capture RGB565 frames from %s and render them into the\n",
+  printf("Capture RGB565 frames from %s and copy them into the\n",
          CAMPREVIEW_VIDEO_DEV);
-  printf("RGB888 framebuffer %s.\n", CAMPREVIEW_FB_DEV);
+  printf("RGB565 framebuffer %s.\n", CAMPREVIEW_FB_DEV);
   printf("\n");
   printf("  nframes  Number of frames to preview.  0 (the default) means\n");
   printf("           run until an error occurs or SIGINT is received.\n");
@@ -142,43 +142,6 @@ static uint64_t campreview_now_ms(void)
 
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return (uint64_t)ts.tv_sec * 1000 + (uint64_t)(ts.tv_nsec / 1000000);
-}
-
-/****************************************************************************
- * Name: campreview_convert
- *
- * Description:
- *   Expand one RGB565 frame into the RGB888 framebuffer.
- *
- *   RGB565 source words are 16-bit little-endian, laid out as
- *   RRRRRGGG GGGBBBBB.  The DSI framebuffer stores the three components in
- *   R, G, B byte order (the display self-test writes fb[0]=0xff to get
- *   red).  Each component is expanded by bit replication so that a
- *   full-scale source value maps to 0xff.
- *
- *   No scaling is done: the caller has already verified that the capture
- *   and panel resolutions match.
- *
- ****************************************************************************/
-
-static void campreview_convert(FAR const uint8_t *src, FAR uint8_t *dst,
-                               uint32_t npixels)
-{
-  FAR const uint16_t *s = (FAR const uint16_t *)src;
-  FAR uint8_t *d = dst;
-  uint32_t i;
-
-  for (i = 0; i < npixels; i++)
-    {
-      uint16_t pix = *s++;
-      uint8_t r5 = (uint8_t)(pix >> 11);
-      uint8_t g6 = (uint8_t)((pix >> 5) & 0x3f);
-      uint8_t b5 = (uint8_t)(pix & 0x1f);
-
-      *d++ = (uint8_t)((r5 << 3) | (r5 >> 2));
-      *d++ = (uint8_t)((g6 << 2) | (g6 >> 4));
-      *d++ = (uint8_t)((b5 << 3) | (b5 >> 2));
-    }
 }
 
 /****************************************************************************
@@ -238,16 +201,16 @@ static int campreview_fb_open(FAR struct campreview_state_s *st)
          st->vinfo.xres, st->vinfo.yres, st->vinfo.fmt,
          st->pinfo.bpp, st->pinfo.stride, st->pinfo.fblen);
 
-  if (st->vinfo.fmt != FB_FMT_RGB24 || st->pinfo.bpp != 24)
+  if (st->vinfo.fmt != FB_FMT_RGB16_565 || st->pinfo.bpp != 16)
     {
-      printf("campreview: ERROR: need FB_FMT_RGB24 (%d) at 24bpp, "
+      printf("campreview: ERROR: need FB_FMT_RGB16_565 (%d) at 16bpp, "
              "got fmt=%u bpp=%u\n",
-             FB_FMT_RGB24, st->vinfo.fmt, st->pinfo.bpp);
+             FB_FMT_RGB16_565, st->vinfo.fmt, st->pinfo.bpp);
       return -ENOTSUP;
     }
 
   if (st->vinfo.xres == 0 || st->vinfo.yres == 0 ||
-      st->pinfo.stride < (unsigned)st->vinfo.xres * 3 ||
+      st->pinfo.stride < (unsigned)st->vinfo.xres * 2 ||
       st->pinfo.fblen < (size_t)st->pinfo.stride * st->vinfo.yres)
     {
       printf("campreview: ERROR: inconsistent fb geometry\n");
@@ -405,7 +368,10 @@ static void campreview_cleanup(FAR struct campreview_state_s *st)
  * Name: campreview_loop
  *
  * Description:
- *   Dequeue, convert, hand the framebuffer to the display, requeue.
+ *   Dequeue, copy, hand the framebuffer to the display, requeue.
+ *
+ *   Both the capture buffer and the framebuffer are RGB565, so the frame
+ *   is a straight copy with no colour-space work at all.
  *
  *   FBIOPAN_DISPLAY is what reaches the driver's pandisplay hook, which
  *   performs the cache writeback the DSI DMA needs.  FBIO_UPDATE is not
@@ -451,18 +417,27 @@ static int campreview_loop(FAR struct campreview_state_s *st,
           return -errno;
         }
 
-      /* Convert row by row so that a framebuffer stride wider than
-       * xres * 3 is handled correctly.
-       */
-
       src = (FAR const uint8_t *)(uintptr_t)buf.m.userptr;
       dst = st->fbmem;
 
-      for (row = 0; row < nrows; row++)
+      if (st->pinfo.stride == srcstride)
         {
-          campreview_convert(src, dst, rowpixels);
-          src += srcstride;
-          dst += st->pinfo.stride;
+          /* Contiguous: one memcpy for the whole frame. */
+
+          memcpy(dst, src, (size_t)srcstride * nrows);
+        }
+      else
+        {
+          /* Copy row by row so that a framebuffer stride wider than
+           * xres * 2 is handled correctly.
+           */
+
+          for (row = 0; row < nrows; row++)
+            {
+              memcpy(dst, src, srcstride);
+              src += srcstride;
+              dst += st->pinfo.stride;
+            }
         }
 
       /* Hand the framebuffer to the display.  This is the cache
@@ -555,7 +530,7 @@ int main(int argc, FAR char *argv[])
       return EXIT_FAILURE;
     }
 
-  printf("campreview: preview %ux%u RGB565 -> RGB888, %s\n",
+  printf("campreview: preview %ux%u RGB565 -> RGB565, %s\n",
          st.vinfo.xres, st.vinfo.yres,
          nframes == 0 ? "until stopped" : "limited run");
 
