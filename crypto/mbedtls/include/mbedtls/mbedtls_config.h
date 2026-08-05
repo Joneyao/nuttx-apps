@@ -4665,4 +4665,20 @@
 
 /** \} name SECTION: Module configuration options */
 
+/* Undefine features that conflict with ESP-HAL sdkconfig.h.
+ * The ESP-HAL undefines CONFIG_MBEDTLS_ECP_C, CONFIG_MBEDTLS_ECDH_C, etc.
+ * which are prerequisites for these features. Undefining them here prevents
+ * mbedtls/check_config.h from complaining about missing prerequisites.
+ * These features are not needed for the basic TLS client functionality. */
+#undef MBEDTLS_ECJPAKE_C
+#undef MBEDTLS_ECDSA_C
+#undef MBEDTLS_ECDSA_DETERMINISTIC
+#undef MBEDTLS_KEY_EXCHANGE_ECDH_RSA_ENABLED
+#undef MBEDTLS_KEY_EXCHANGE_ECDHE_PSK_ENABLED
+#undef MBEDTLS_KEY_EXCHANGE_ECDHE_RSA_ENABLED
+#undef MBEDTLS_KEY_EXCHANGE_ECDHE_ECDSA_ENABLED
+#undef MBEDTLS_SSL_DTLS_CONNECTION_ID
+#undef MBEDTLS_SSL_DTLS_CONNECTION_ID_COMPAT
+#undef MBEDTLS_SSL_CONTEXT_SERIALIZATION
+
 #endif /* __APPS_CRYPTO_MBEDTLS_INCLUDE_MBEDTLS_MBEDTLS_CONFIG_H */

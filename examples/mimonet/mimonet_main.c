@@ -36,7 +36,7 @@
 
 #include <arch/board/board_secrets.h>
 
-#include "cJSON.h"
+#include "netutils/cJSON.h"
 
 /****************************************************************************
  * Pre-processor Definitions
