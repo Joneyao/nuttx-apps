@@ -4670,6 +4670,8 @@
  * which are prerequisites for these features. Undefining them here prevents
  * mbedtls/check_config.h from complaining about missing prerequisites.
  * These features are not needed for the basic TLS client functionality. */
+/* Undefine features incompatible with ESP-HAL sdkconfig.h */
+#undef MBEDTLS_LMS_C
 #undef MBEDTLS_ECJPAKE_C
 #undef MBEDTLS_ECDSA_C
 #undef MBEDTLS_ECDSA_DETERMINISTIC
