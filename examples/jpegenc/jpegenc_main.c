@@ -72,6 +72,7 @@ int main(int argc, char *argv[])
   MARK('@');                     /* main entry */
   MARK('A');                     /* before 1st printf */
   uint32_t prev = *PREV_MARK_ADDR;
+  (void)prev;
   MARK('B');                     /* after skipped printf */
   dbg_mark_char('#');            /* RAM-write self-test: expect 0x23 */
   MARK('C');                     /* after dbg_mark */
