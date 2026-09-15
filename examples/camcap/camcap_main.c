@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
@@ -87,7 +88,7 @@ int main(int argc, char *argv[])
       buf.type      = type;
       buf.memory    = V4L2_MEMORY_USERPTR;
       buf.index     = i;
-      buf.m.userptr = (unsigned long)bufs[i];
+      buf.m.userptr = (uintptr_t)bufs[i];
       buf.length    = framesize;
       if (xioctl(fd, VIDIOC_QBUF, &buf) < 0)
         { printf("ERROR: QBUF %d: %d\n", i, errno); goto out; }
