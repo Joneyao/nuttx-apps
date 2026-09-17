@@ -185,6 +185,15 @@ static void ui_gt911_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
               ui_eq_post(&g_events, ev);
             }
         }
+      else
+        {
+          /* The press was missed (the GT911 lift is reported but the brief
+           * down was not polled).  Treat the release itself as a tap so the
+           * capture still triggers without relying on the press coordinate.
+           */
+
+          ui_eq_post(&g_events, EVENT_TAP);
+        }
 
       g_gesture.down = false;
       data->point.x = g_gesture.last_x;
