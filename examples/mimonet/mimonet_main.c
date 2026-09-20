@@ -42,7 +42,7 @@
  * Pre-processor Definitions
  ****************************************************************************/
 
-/* /v1/models 的响应实测约 400 字节，留足余量。 */
+/* /v1/models response measured ~400 bytes; leave headroom. */
 
 #define MIMONET_RSP_MAX  4096
 
@@ -393,7 +393,7 @@ static int stage_http(struct mimonet_ctx_s *ctx)
       return -1;
     }
 
-  /* 读到对端关闭为止。请求里带了 Connection: close，所以 EOF 即完整响应。 */
+  /* Read until peer closes. Request carries Connection: close, so EOF is the full response. */
 
   for (; ; )
     {
@@ -447,7 +447,7 @@ static int stage_http(struct mimonet_ctx_s *ctx)
       return -1;
     }
 
-  /* 空行分隔头与体。 */
+  /* Blank line separates header from body. */
 
   body = strstr(rsp, "\r\n\r\n");
   if (body == NULL)

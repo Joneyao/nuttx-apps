@@ -8,7 +8,7 @@ config FEISHU_NOTIFY
 	default n
 	select NETUTILS_CJSON
 	---help---
-		Enables a minimal Feishu (飞书) notification client that sends text
+		Enables a minimal Feishu notification client that sends text
 		messages to a Feishu group chat via the Feishu OpenAPI
 		(tenant_access_token + im/v1/messages) over HTTPS/TLS.
 
